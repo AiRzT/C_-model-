@@ -1,0 +1,543 @@
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.integrate import solve_ivp
+from scipy.optimize import minimize_scalar
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    case_name: str
+    data_file: Path
+    output_dir: Path
+    biomass_unit: str
+    initial_from_first_observation: bool
+    X0_g_dw_L: float
+    S0_mg_L: float
+    mu_max_day: float
+    K_s_mg_L: float
+    Y_XS_g_dw_per_g_substrate: float
+    frequency_hz: float
+    amplitude_cm: float
+    D_AB_m2_day: float
+    nu_m2_s: float
+    alpha_m2_g_dw: float
+    fit_log10_Cmodel_bounds: tuple[float, float]
+    profile_log10_half_width: float
+    profile_points: int
+    smooth_points: int
+
+
+def load_config(path: Path) -> ModelConfig:
+    with path.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    base = path.parent
+    return ModelConfig(
+        case_name=raw["case_name"],
+        data_file=(base / raw["data_file"]).resolve(),
+        output_dir=(base / raw["output_dir"]).resolve(),
+        biomass_unit=raw.get("biomass_unit", "mg_dw_L"),
+        initial_from_first_observation=bool(raw.get("initial_from_first_observation", False)),
+        X0_g_dw_L=float(raw["X0_g_dw_L"]),
+        S0_mg_L=float(raw["S0_mg_L"]),
+        mu_max_day=float(raw["mu_max_day"]),
+        K_s_mg_L=float(raw["K_s_mg_L"]),
+        Y_XS_g_dw_per_g_substrate=float(raw["Y_XS_g_dw_per_g_substrate"]),
+        frequency_hz=float(raw["frequency_hz"]),
+        amplitude_cm=float(raw["amplitude_cm"]),
+        D_AB_m2_day=float(raw["D_AB_m2_day"]),
+        nu_m2_s=float(raw["nu_m2_s"]),
+        alpha_m2_g_dw=float(raw["alpha_m2_g_dw"]),
+        fit_log10_Cmodel_bounds=tuple(raw["fit_log10_Cmodel_bounds"]),
+        profile_log10_half_width=float(raw.get("profile_log10_half_width", 2.0)),
+        profile_points=int(raw.get("profile_points", 241)),
+        smooth_points=int(raw.get("smooth_points", 500)),
+    )
+
+
+def read_data(path: Path, biomass_unit: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    required = {"time_day", "biomass_mg_dw_L"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns in {path}: {sorted(missing)}")
+
+    df = df.sort_values("time_day").reset_index(drop=True)
+    if df["time_day"].duplicated().any():
+        raise ValueError("time_day values must be unique.")
+    if (df["time_day"] < 0).any():
+        raise ValueError("time_day values must be nonnegative.")
+    if (df["biomass_mg_dw_L"] < 0).any():
+        raise ValueError("Biomass values must be nonnegative.")
+
+    if biomass_unit != "mg_dw_L":
+        raise ValueError("Only biomass_unit='mg_dw_L' is currently supported.")
+
+    df["biomass_g_dw_L"] = df["biomass_mg_dw_L"] / 1000.0
+
+    if "biomass_sd_mg_dw_L" in df.columns:
+        sd = pd.to_numeric(df["biomass_sd_mg_dw_L"], errors="coerce")
+        df["biomass_sd_g_dw_L"] = sd / 1000.0
+    else:
+        df["biomass_sd_g_dw_L"] = np.nan
+
+    return df
+
+
+def transfer_factor(config: ModelConfig) -> float:
+    """Return the multiplier between C_model and k_L.
+
+    The factor follows the manuscript scaling. Units are model-dependent
+    because C_model absorbs geometry, proportionality, and unit-conversion
+    terms.
+    """
+    return (
+        np.sqrt(config.D_AB_m2_day)
+        / (config.nu_m2_s ** 0.25)
+        * np.sqrt(config.amplitude_cm)
+        * (config.frequency_hz ** 0.75)
+    )
+
+
+def cmodel_to_kL(C_model: float, config: ModelConfig) -> float:
+    return C_model * transfer_factor(config)
+
+
+def cmodel_to_K_mass(C_model: float, config: ModelConfig) -> float:
+    # K_mass is the effective coefficient in:
+    # K_mass * (S_bulk - S_cell) = (1000 / Y_XS) * mu
+    return 1000.0 * config.alpha_m2_g_dw * cmodel_to_kL(C_model, config)
+
+
+def solve_s_cell(S_bulk: float, K_mass: float, config: ModelConfig) -> float:
+    if S_bulk <= 0.0 or K_mass <= 0.0:
+        return 0.0
+
+    Ks = config.K_s_mg_L
+    V = (1000.0 / config.Y_XS_g_dw_per_g_substrate) * config.mu_max_day
+
+    a = K_mass
+    b = K_mass * Ks - K_mass * S_bulk + V
+    c = -K_mass * S_bulk * Ks
+    disc = max(b * b - 4.0 * a * c, 0.0)
+    root = (-b + np.sqrt(disc)) / (2.0 * a)
+    return float(np.clip(root, 0.0, S_bulk))
+
+
+def simulate(
+    C_model: float,
+    t_eval: np.ndarray,
+    config: ModelConfig,
+    X0_g_dw_L: float,
+) -> pd.DataFrame:
+    K_mass = cmodel_to_K_mass(C_model, config)
+
+    def rhs(_t: float, y: np.ndarray) -> list[float]:
+        X = max(float(y[0]), 0.0)
+        S_bulk = max(float(y[1]), 0.0)
+
+        S_cell = solve_s_cell(S_bulk, K_mass, config)
+        if S_cell <= 0.0:
+            mu = 0.0
+        else:
+            mu = config.mu_max_day * S_cell / (config.K_s_mg_L + S_cell)
+
+        dXdt = mu * X
+        dSdt = -(1000.0 / config.Y_XS_g_dw_per_g_substrate) * dXdt
+        if S_bulk <= 0.0 and dSdt < 0.0:
+            dSdt = 0.0
+        return [dXdt, dSdt]
+
+    t_eval = np.asarray(t_eval, dtype=float)
+    if len(t_eval) == 0:
+        raise ValueError("t_eval must contain at least one time point.")
+    if np.any(np.diff(t_eval) < 0):
+        raise ValueError("t_eval must be sorted in ascending order.")
+
+    t_end = max(float(t_eval[-1]), 1e-9)
+    sol = solve_ivp(
+        rhs,
+        t_span=(0.0, t_end),
+        y0=[X0_g_dw_L, config.S0_mg_L],
+        t_eval=t_eval,
+        method="BDF",
+        rtol=1e-7,
+        atol=1e-10,
+    )
+    if not sol.success:
+        raise RuntimeError(sol.message)
+
+    X = np.maximum(sol.y[0], 0.0)
+    S_bulk = np.maximum(sol.y[1], 0.0)
+    S_cell = np.array([solve_s_cell(s, K_mass, config) for s in S_bulk])
+    mu = config.mu_max_day * S_cell / np.maximum(config.K_s_mg_L + S_cell, 1e-30)
+
+    return pd.DataFrame(
+        {
+            "time_day": t_eval,
+            "biomass_model_g_dw_L": X,
+            "biomass_model_mg_dw_L": X * 1000.0,
+            "S_bulk_mg_L": S_bulk,
+            "S_cell_mg_L": S_cell,
+            "mu_day": mu,
+        }
+    )
+
+
+def weights_from_data(df: pd.DataFrame) -> np.ndarray:
+    sd = df["biomass_sd_g_dw_L"].to_numpy(dtype=float)
+    valid = np.isfinite(sd) & (sd > 0.0)
+    if valid.all():
+        weights = 1.0 / (sd * sd)
+        return weights / np.mean(weights)
+    return np.ones(len(df), dtype=float)
+
+
+def fit_cmodel(config: ModelConfig, df: pd.DataFrame) -> dict[str, float | np.ndarray]:
+    t_obs = df["time_day"].to_numpy(dtype=float)
+    x_obs = df["biomass_g_dw_L"].to_numpy(dtype=float)
+    weights = weights_from_data(df)
+    X0 = float(x_obs[0]) if config.initial_from_first_observation else config.X0_g_dw_L
+
+    def objective(log10_C: float) -> float:
+        C_model = 10.0**log10_C
+        try:
+            pred = simulate(C_model, t_obs, config, X0)["biomass_model_g_dw_L"].to_numpy()
+        except Exception:
+            return np.inf
+        residual = x_obs - pred
+        return float(np.sum(weights * residual * residual))
+
+    opt = minimize_scalar(
+        objective,
+        bounds=config.fit_log10_Cmodel_bounds,
+        method="bounded",
+        options={"xatol": 1e-6},
+    )
+    if not opt.success:
+        raise RuntimeError(f"C_model optimization failed: {opt.message}")
+
+    log10_C = float(opt.x)
+    C_model = 10.0**log10_C
+    obs_pred = simulate(C_model, t_obs, config, X0)
+    x_pred = obs_pred["biomass_model_g_dw_L"].to_numpy()
+    residual = x_obs - x_pred
+
+    sse = float(np.sum(residual * residual))
+    weighted_sse = float(np.sum(weights * residual * residual))
+    rmse = float(np.sqrt(np.mean(residual * residual)))
+    mae = float(np.mean(np.abs(residual)))
+    ss_total = float(np.sum((x_obs - np.mean(x_obs)) ** 2))
+    r2 = float(1.0 - sse / ss_total) if ss_total > 0 else np.nan
+
+    return {
+        "C_model": C_model,
+        "log10_C_model": log10_C,
+        "K_mass_day_inv": cmodel_to_K_mass(C_model, config),
+        "k_L_m_day": cmodel_to_kL(C_model, config),
+        "transfer_factor": transfer_factor(config),
+        "X0_used_g_dw_L": X0,
+        "sse_g2_L2": sse,
+        "weighted_sse": weighted_sse,
+        "rmse_g_dw_L": rmse,
+        "mae_g_dw_L": mae,
+        "r2": r2,
+        "weights": weights,
+        "obs_pred": obs_pred,
+        "residual_g_dw_L": residual,
+        "objective": objective,
+    }
+
+
+def write_outputs(config: ModelConfig, df: pd.DataFrame, fit: dict[str, float | np.ndarray]) -> None:
+    output_dir = config.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    C_model = float(fit["C_model"])
+    X0 = float(fit["X0_used_g_dw_L"])
+
+    t_smooth = np.linspace(0.0, float(df["time_day"].max()), config.smooth_points)
+    smooth = simulate(C_model, t_smooth, config, X0)
+    smooth.to_csv(output_dir / "fitted_curve.csv", index=False)
+
+    obs_pred = fit["obs_pred"]
+    if not isinstance(obs_pred, pd.DataFrame):
+        raise TypeError("Internal error: obs_pred is not a DataFrame")
+
+    residual = np.asarray(fit["residual_g_dw_L"], dtype=float)
+    residuals = pd.DataFrame(
+        {
+            "time_day": df["time_day"],
+            "biomass_obs_mg_dw_L": df["biomass_mg_dw_L"],
+            "biomass_model_mg_dw_L": obs_pred["biomass_model_mg_dw_L"],
+            "residual_mg_dw_L": residual * 1000.0,
+            "weight": np.asarray(fit["weights"], dtype=float),
+        }
+    )
+    residuals.to_csv(output_dir / "residuals.csv", index=False)
+
+    lower = max(
+        config.fit_log10_Cmodel_bounds[0],
+        float(fit["log10_C_model"]) - config.profile_log10_half_width,
+    )
+    upper = min(
+        config.fit_log10_Cmodel_bounds[1],
+        float(fit["log10_C_model"]) + config.profile_log10_half_width,
+    )
+    log_grid = np.linspace(lower, upper, config.profile_points)
+    objective = fit["objective"]
+    if not callable(objective):
+        raise TypeError("Internal error: objective is not callable")
+    sse_profile = np.array([objective(v) for v in log_grid])
+    profile = pd.DataFrame(
+        {
+            "log10_C_model": log_grid,
+            "C_model": 10.0**log_grid,
+            "weighted_sse": sse_profile,
+            "delta_weighted_sse": sse_profile - np.nanmin(sse_profile),
+            "relative_weighted_sse": sse_profile / np.nanmin(sse_profile),
+        }
+    )
+    profile.to_csv(output_dir / "Cmodel_profile.csv", index=False)
+
+    parameters = pd.DataFrame(
+        [
+            {
+                "case_name": config.case_name,
+                "C_model": fit["C_model"],
+                "log10_C_model": fit["log10_C_model"],
+                "K_mass_day_inv": fit["K_mass_day_inv"],
+                "k_L_m_day": fit["k_L_m_day"],
+                "transfer_factor": fit["transfer_factor"],
+                "X0_used_g_dw_L": fit["X0_used_g_dw_L"],
+                "S0_mg_L": config.S0_mg_L,
+                "mu_max_day": config.mu_max_day,
+                "K_s_mg_L": config.K_s_mg_L,
+                "Y_XS_g_dw_per_g_substrate": config.Y_XS_g_dw_per_g_substrate,
+                "frequency_hz": config.frequency_hz,
+                "amplitude_cm": config.amplitude_cm,
+                "D_AB_m2_day": config.D_AB_m2_day,
+                "nu_m2_s": config.nu_m2_s,
+                "alpha_m2_g_dw": config.alpha_m2_g_dw,
+                "sse_g2_L2": fit["sse_g2_L2"],
+                "weighted_sse": fit["weighted_sse"],
+                "rmse_g_dw_L": fit["rmse_g_dw_L"],
+                "mae_g_dw_L": fit["mae_g_dw_L"],
+                "r2": fit["r2"],
+                "interpretation": "effective reactor-specific fitted parameter; not a universal physical constant",
+            }
+        ]
+    )
+    parameters.to_csv(output_dir / "fitted_parameters.csv", index=False)
+
+    plot_model_fit(df, smooth, residuals, profile, parameters.iloc[0], output_dir)
+
+
+def plot_model_fit(
+    df: pd.DataFrame,
+    smooth: pd.DataFrame,
+    residuals: pd.DataFrame,
+    profile: pd.DataFrame,
+    params: pd.Series,
+    output_dir: Path,
+) -> None:
+    plt.rcParams.update(
+        {
+            "font.family": "Arial",
+            "mathtext.fontset": "stix",
+            "axes.linewidth": 1.2,
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.top": True,
+            "ytick.right": True,
+        }
+    )
+
+    fig, ax = plt.subplots(figsize=(5.6, 4.4), dpi=300)
+    ax.plot(
+        smooth["time_day"],
+        smooth["biomass_model_mg_dw_L"],
+        color="#d55e00",
+        linewidth=2.2,
+        label="DAE fit",
+    )
+    yerr = df.get("biomass_sd_mg_dw_L")
+    if yerr is not None and np.isfinite(pd.to_numeric(yerr, errors="coerce")).all():
+        ax.errorbar(
+            df["time_day"],
+            df["biomass_mg_dw_L"],
+            yerr=pd.to_numeric(yerr, errors="coerce"),
+            fmt="o",
+            color="black",
+            markerfacecolor="white",
+            markeredgewidth=1.4,
+            capsize=3,
+            label="Observed biomass",
+        )
+    else:
+        ax.plot(
+            df["time_day"],
+            df["biomass_mg_dw_L"],
+            "o",
+            color="black",
+            markerfacecolor="white",
+            markeredgewidth=1.4,
+            label="Observed biomass",
+        )
+    ax.set_xlabel("Cultivation time (days)")
+    ax.set_ylabel("Biomass (mg DW L$^{-1}$)")
+    ax.legend(frameon=False)
+    ax.text(
+        0.03,
+        0.97,
+        f"$C_{{model}}$ = {params['C_model']:.3e}\n$R^2$ = {params['r2']:.3f}",
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9.5,
+    )
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    fig.tight_layout()
+    fig.savefig(output_dir / "fitted_curve.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(5.6, 3.4), dpi=300)
+    ax.axhline(0.0, color="0.35", linewidth=1.0, linestyle="--")
+    ax.plot(
+        residuals["time_day"],
+        residuals["residual_mg_dw_L"],
+        "o-",
+        color="#0072b2",
+        markerfacecolor="white",
+        markeredgewidth=1.3,
+    )
+    ax.set_xlabel("Cultivation time (days)")
+    ax.set_ylabel("Residual (mg DW L$^{-1}$)")
+    fig.tight_layout()
+    fig.savefig(output_dir / "residuals.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(5.6, 3.6), dpi=300)
+    ax.plot(
+        profile["log10_C_model"],
+        profile["relative_weighted_sse"],
+        color="#009e73",
+        linewidth=2.0,
+    )
+    ax.axvline(np.log10(params["C_model"]), color="0.25", linestyle="--", linewidth=1.1)
+    ax.set_xlabel("log$_{10}(C_{model})$")
+    ax.set_ylabel("Relative weighted SSE")
+    ax.set_ylim(bottom=0)
+    fig.tight_layout()
+    fig.savefig(output_dir / "Cmodel_profile.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Optional path to a JSON configuration file.",
+    )
+    parser.add_argument(
+        "--data",
+        type=Path,
+        default=None,
+        help="Path to user-supplied biomass CSV data. Required unless the JSON config defines data_file.",
+    )
+    parser.add_argument("--case-name", default="user_supplied_case")
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--biomass-unit", default="mg_dw_L")
+    parser.add_argument(
+        "--initial-from-first-observation",
+        action="store_true",
+        help="Use the first observed biomass value as X0.",
+    )
+    parser.add_argument("--X0-g-dw-L", type=float, default=0.0026)
+    parser.add_argument("--S0-mg-L", type=float, default=7.1)
+    parser.add_argument("--mu-max-day", type=float, default=0.25)
+    parser.add_argument("--K-s-mg-L", type=float, default=0.054)
+    parser.add_argument("--Y-XS-g-dw-per-g-substrate", type=float, default=15.7)
+    parser.add_argument("--frequency-hz", type=float, default=0.5)
+    parser.add_argument("--amplitude-cm", type=float, default=6.0)
+    parser.add_argument("--D-AB-m2-day", type=float, default=8.64e-5)
+    parser.add_argument("--nu-m2-s", type=float, default=1.0e-6)
+    parser.add_argument("--alpha-m2-g-dw", type=float, default=1.0)
+    parser.add_argument(
+        "--fit-log10-Cmodel-bounds",
+        type=float,
+        nargs=2,
+        metavar=("LOW", "HIGH"),
+        default=(-8.0, 2.0),
+    )
+    parser.add_argument("--profile-log10-half-width", type=float, default=2.0)
+    parser.add_argument("--profile-points", type=int, default=241)
+    parser.add_argument("--smooth-points", type=int, default=500)
+    return parser.parse_args()
+
+
+def config_from_args(args: argparse.Namespace) -> ModelConfig:
+    if args.data is None:
+        raise SystemExit("Error: provide --data CSV path, or provide --config with a data_file entry.")
+
+    return ModelConfig(
+        case_name=args.case_name,
+        data_file=args.data.resolve(),
+        output_dir=(args.output_dir or Path("output")).resolve(),
+        biomass_unit=args.biomass_unit,
+        initial_from_first_observation=bool(args.initial_from_first_observation),
+        X0_g_dw_L=float(args.X0_g_dw_L),
+        S0_mg_L=float(args.S0_mg_L),
+        mu_max_day=float(args.mu_max_day),
+        K_s_mg_L=float(args.K_s_mg_L),
+        Y_XS_g_dw_per_g_substrate=float(args.Y_XS_g_dw_per_g_substrate),
+        frequency_hz=float(args.frequency_hz),
+        amplitude_cm=float(args.amplitude_cm),
+        D_AB_m2_day=float(args.D_AB_m2_day),
+        nu_m2_s=float(args.nu_m2_s),
+        alpha_m2_g_dw=float(args.alpha_m2_g_dw),
+        fit_log10_Cmodel_bounds=tuple(args.fit_log10_Cmodel_bounds),
+        profile_log10_half_width=float(args.profile_log10_half_width),
+        profile_points=int(args.profile_points),
+        smooth_points=int(args.smooth_points),
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    if args.config is not None:
+        config = load_config(args.config.resolve())
+        if args.data is not None:
+            config = replace(config, data_file=args.data.resolve())
+        if args.output_dir is not None:
+            config = replace(config, output_dir=args.output_dir.resolve())
+    else:
+        config = config_from_args(args)
+
+    df = read_data(config.data_file, config.biomass_unit)
+    fit = fit_cmodel(config, df)
+    write_outputs(config, df, fit)
+
+    print("C_model fitting complete.")
+    print(f"Case: {config.case_name}")
+    print(f"C_model = {float(fit['C_model']):.6e}")
+    print(f"K_mass = {float(fit['K_mass_day_inv']):.6e} day^-1")
+    print(f"k_L = {float(fit['k_L_m_day']):.6e} m day^-1")
+    print(f"R2 = {float(fit['r2']):.4f}")
+    print(f"RMSE = {float(fit['rmse_g_dw_L']) * 1000.0:.4f} mg DW L^-1")
+    print(f"Outputs written to: {config.output_dir}")
+
+
+if __name__ == "__main__":
+    main()
