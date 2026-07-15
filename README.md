@@ -1,4 +1,4 @@
-# C<sub>model</sub> Fitting for Biomass Growth in a Reciprocating-Shaking Photobioreactors
+# C<sub>model</sub> Fitting for Biomass Growth in a Reciprocating-Shaking Photobioreactor
 
 This repository provides a Python workflow for fitting an effective mass-transfer parameter, `C_model`, from biomass growth data in a reciprocating-shaking photobioreactor. The script couples a Monod-type biomass growth model with an effective substrate transfer formulation and estimates the reactor-specific `C_model` by minimizing the weighted sum of squared biomass residuals.
 
